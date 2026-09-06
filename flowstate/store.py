@@ -10,17 +10,21 @@ from .config import data_root
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
+
 class FlowStateError(ValueError):
     pass
 
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _safe_id(value: str, label: str) -> str:
     value = str(value)
     if not SAFE_ID.fullmatch(value):
         raise FlowStateError(f"Invalid {label}. Use only letters, numbers, dot, underscore, or dash.")
     return value
+
 
 def _campaign_dir(campaign_id: str) -> Path:
     cid = _safe_id(campaign_id, "campaign_id")
@@ -30,27 +34,41 @@ def _campaign_dir(campaign_id: str) -> Path:
         raise FlowStateError("Campaign path escaped data root.")
     return path
 
+
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     temp.replace(path)
 
+
 def _read_json(path: Path, default=None):
     if not path.exists():
         return default
     return json.loads(path.read_text(encoding="utf-8"))
+
 
 def _append_jsonl(path: Path, item: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(item, sort_keys=True) + "\n")
 
+
+def _observation_sort_key(obs: dict) -> tuple:
+    return (
+        str(obs.get("timestamp") or "9999-12-31T23:59:59+00:00"),
+        str(obs.get("actor_id") or ""),
+        int(obs.get("sequence_index") or 0),
+        str(obs.get("observation_id") or ""),
+    )
+
+
 def audit(campaign_id: str, event: str, details: dict | None = None) -> None:
     _append_jsonl(
         _campaign_dir(campaign_id) / "audit.jsonl",
         {"timestamp": now_iso(), "event": event, "details": details or {}},
     )
+
 
 def create_campaign(name: str, target_host: str, notes: str | None = None) -> dict:
     if not name.strip():
@@ -77,11 +95,13 @@ def create_campaign(name: str, target_host: str, notes: str | None = None) -> di
     audit(cid, "campaign_created", {"target_host": host})
     return metadata
 
+
 def get_campaign(campaign_id: str) -> dict:
     data = _read_json(_campaign_dir(campaign_id) / "campaign.json")
     if not data:
         raise FlowStateError("Campaign not found")
     return data
+
 
 def list_campaigns(limit: int = 50) -> list[dict]:
     base = data_root() / "campaigns"
@@ -96,6 +116,7 @@ def list_campaigns(limit: int = 50) -> list[dict]:
             items.append(data)
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return items[: max(1, min(int(limit), 200))]
+
 
 def register_actor(campaign_id: str, actor_id: str, name: str, roles: list[str] | None = None, notes: str | None = None) -> dict:
     get_campaign(campaign_id)
@@ -116,12 +137,15 @@ def register_actor(campaign_id: str, actor_id: str, name: str, roles: list[str] 
     audit(campaign_id, "actor_registered", {"actor_id": aid, "roles": actor["roles"]})
     return actor
 
+
 def list_actors(campaign_id: str) -> list[dict]:
     get_campaign(campaign_id)
     return _read_json(_campaign_dir(campaign_id) / "actors.json", [])
 
+
 def actor_exists(campaign_id: str, actor_id: str) -> bool:
     return any(a["actor_id"] == actor_id for a in list_actors(campaign_id))
+
 
 def save_observations(campaign_id: str, observations: list[dict], max_observations: int) -> dict:
     get_campaign(campaign_id)
@@ -130,6 +154,7 @@ def save_observations(campaign_id: str, observations: list[dict], max_observatio
     room = max(0, max_observations - len(existing))
     accepted = observations[:room]
     existing.extend(accepted)
+    existing.sort(key=_observation_sort_key)
     _write_json(path, existing)
     audit(campaign_id, "observations_saved", {"accepted": len(accepted), "dropped": len(observations) - len(accepted)})
     return {
@@ -138,14 +163,19 @@ def save_observations(campaign_id: str, observations: list[dict], max_observatio
         "total": len(existing),
     }
 
+
 def list_observations(campaign_id: str, actor_id: str | None = None, limit: int = 200) -> list[dict]:
     get_campaign(campaign_id)
     observations = _read_json(_campaign_dir(campaign_id) / "observations.json", [])
     if actor_id:
         observations = [o for o in observations if o.get("actor_id") == actor_id]
+    observations.sort(key=_observation_sort_key)
     limit = max(1, min(int(limit), 1000))
     return observations[-limit:]
 
+
 def all_observations(campaign_id: str) -> list[dict]:
     get_campaign(campaign_id)
-    return _read_json(_campaign_dir(campaign_id) / "observations.json", [])
+    observations = _read_json(_campaign_dir(campaign_id) / "observations.json", [])
+    observations.sort(key=_observation_sort_key)
+    return observations
