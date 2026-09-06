@@ -134,17 +134,44 @@ Queue behavior is intentionally conservative:
 - an `intermediate_state_access` umbrella hypothesis does not compete with concrete `workflow_checkpoint_access` children for the same actor and destination;
 - resolving one child hypothesis does **not** automatically mark its broader parent supported or falsified.
 
-For example:
+This is prioritization only. FlowState still does not send validation traffic.
+
+## v0.1.6 workflow dominance and subsumption
+
+v0.1.6 prevents the next-action queue from recommending redundant workflow tests when a **stronger earlier checkpoint** has already been directly supported.
+
+The rule is structural, not path-specific. For the same actor and destination, if a supported `workflow_checkpoint_access` hypothesis shows that the destination was already reachable at checkpoint A, then FlowState can safely treat certain later questions as queue-only `subsumed` work:
+
+- a later `workflow_checkpoint_access` hypothesis whose checkpoint was still listed as a remaining prerequisite after A;
+- a `skip_step` hypothesis for a prerequisite that was also still listed after A.
+
+Example:
 
 ```text
-SUPPORTED  score 95  checkpoint after step A
-UNTESTED   score 90  checkpoint after step B
-UNTESTED   score 50  explicit prerequisite omission
+resource denied
+      ↓
+checkpoint A       ← directly tested: resource succeeds here
+      ↓
+checkpoint B       ← later checkpoint question is subsumed
+      ↓
+step C             ← skip-C question is subsumed for earliest-access reasoning
+      ↓
+resource succeeds
 ```
 
-The queue recommends the score-90 unresolved checkpoint next while preserving the supported score-95 result as evidence.
+The important distinction is preserved:
 
-This is prioritization only. FlowState still does not send validation traffic.
+```text
+validation_status: untested
+queue_status: subsumed
+subsumed_by: hyp-...
+```
+
+FlowState does **not** rewrite the later hypothesis to `supported`, because it was never directly tested. Subsumption only says another stronger result already answered the same earliest-access question well enough that another request would be redundant.
+
+Subsumption is directional and scoped. A later supported checkpoint does not subsume an earlier checkpoint, and evidence does not cross actors or destinations.
+
+`flow_next_hypotheses` now returns a separate `subsumed` collection and `subsumed_count` alongside the actionable queue.
 
 ## V1 safety boundary
 
@@ -161,7 +188,8 @@ FlowState V1:
 - uses bounded import sizes and bounded observation counts;
 - labels hypotheses as requiring manual validation;
 - records validation outcomes only after an external/manual test has already occurred;
-- prioritizes unresolved hypotheses without changing their evidence state.
+- prioritizes unresolved hypotheses without changing their evidence state;
+- can suppress redundant later workflow questions without marking them directly validated.
 
 Use your existing Burp MCP separately when you intentionally want the AI client to inspect or replay a request.
 
@@ -185,7 +213,7 @@ Use your existing Burp MCP separately when you intentionally want the AI client 
 | `flow_generate_actor_swap_hypotheses` | Generate actor-comparison questions with persistent validation status |
 | `flow_record_hypothesis_validation` | Persist a structured manual validation outcome for a generated hypothesis |
 | `flow_list_hypothesis_validations` | List validation history for a campaign or one hypothesis |
-| `flow_next_hypotheses` | Return the highest-value unresolved hypotheses after accounting for validation history |
+| `flow_next_hypotheses` | Return the highest-value unresolved hypotheses and identify redundant subsumed workflow questions |
 
 ## Install
 
@@ -270,6 +298,8 @@ ScopeNest containers
    supported / falsified /
         inconclusive
               ↓
+   resolve + subsume work
+              ↓
       next unresolved work
 ```
 
@@ -307,7 +337,8 @@ ScopeNest containers
    # the same hypothesis now reports validation_status="supported"
 
 10. flow_next_hypotheses
-    # supported/falsified work is retained as history but omitted from the next-action queue
+    # supported/falsified work is retained as history
+    # later questions may be queue_status="subsumed" when stronger earlier evidence covers them
 
 11. flow_list_hypothesis_validations
 ```
@@ -338,7 +369,7 @@ without turning guesses into facts.
 
 FlowState V1 is successful only if, on a real bug-bounty session, it produces at least one hypothesis that you would genuinely test and that you did not immediately notice from raw Burp history alone.
 
-The next bar is stronger: the hypothesis should survive controlled manual validation, FlowState should preserve that evidence without turning a hypothesis into a vulnerability claim automatically, and later prioritization should move on to the highest-value unresolved work.
+The next bar is stronger: the hypothesis should survive controlled manual validation, FlowState should preserve that evidence without turning a hypothesis into a vulnerability claim automatically, and later prioritization should avoid spending requests on workflow questions already covered by stronger evidence.
 
 ## License
 
