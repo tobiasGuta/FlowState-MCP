@@ -2,22 +2,25 @@ from __future__ import annotations
 
 import base64
 import json
-import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from defusedxml import ElementTree as DET
 
 from .config import limits
-from .sanitize import sanitize_headers, sanitize_path, sanitize_query, summarize_body
+from .sanitize import (
+    cookie_fingerprints,
+    sanitize_headers,
+    sanitize_path,
+    sanitize_query,
+    sanitize_redirect,
+    set_cookie_fingerprints,
+    summarize_body,
+)
 from .store import FlowStateError, actor_exists, get_campaign, now_iso, save_observations
 
-ACTION_HINTS = {
-    "create": ("POST", re.compile(r"/(create|new|register|signup|invite|add)(/|$)", re.I)),
-    "update": ("PATCH", re.compile(r".*")),
-    "update": ("PUT", re.compile(r".*")),
-    "delete": ("DELETE", re.compile(r".*")),
-}
 
 def _bounded_read(path: Path, max_bytes: int) -> bytes:
     if not path.exists() or not path.is_file():
@@ -27,13 +30,16 @@ def _bounded_read(path: Path, max_bytes: int) -> bytes:
         raise FlowStateError(f"Import exceeds maximum size of {max_bytes} bytes")
     return path.read_bytes()
 
+
 def _validate_actor(campaign_id: str, actor_id: str) -> None:
     if not actor_exists(campaign_id, actor_id):
         raise FlowStateError("actor_id is not registered in this campaign")
 
+
 def _target_ok(campaign: dict, url: str) -> bool:
     host = (urlsplit(url).hostname or "").lower()
     return host == campaign["target_host"] or host.endswith("." + campaign["target_host"])
+
 
 def infer_action(method: str, path: str) -> str:
     method = method.upper()
@@ -73,7 +79,57 @@ def infer_action(method: str, path: str) -> str:
         return "delete"
     return "read"
 
-def _observation(actor_id: str, method: str, url: str, req_headers, req_body, status, resp_headers, resp_body, source: str, source_ref: str) -> dict:
+
+def _parse_observed_time(value: str | None) -> tuple[str | None, datetime | None]:
+    raw = (value or "").strip()
+    if not raw:
+        return None, None
+
+    dt: datetime | None = None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            dt = None
+
+    if dt is None:
+        return None, None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(), dt
+
+
+def _session_summary(req_headers, resp_headers) -> dict:
+    req = cookie_fingerprints(req_headers)
+    resp = set_cookie_fingerprints(resp_headers)
+    before = req.get("session")
+    after = resp.get("session")
+    return {
+        "request_cookie_fingerprints": req,
+        "response_cookie_fingerprints": resp,
+        "request_session_fingerprint": before,
+        "response_session_fingerprint": after,
+        "session_changed": bool(before and after and before != after),
+    }
+
+
+def _observation(
+    actor_id: str,
+    method: str,
+    url: str,
+    req_headers,
+    req_body,
+    status,
+    resp_headers,
+    resp_body,
+    source: str,
+    source_ref: str,
+    campaign: dict,
+    observed_at: str | None = None,
+) -> dict:
     clean_url, query_names = sanitize_query(url)
     path = sanitize_path(urlsplit(url).path or "/")
     req_h = sanitize_headers(req_headers)
@@ -84,11 +140,13 @@ def _observation(actor_id: str, method: str, url: str, req_headers, req_body, st
 
     lim = limits()
     req_summary = summarize_body(req_body, req_ct, lim["max_body_bytes"])
-    resp_summary = summarize_body(resp_body, resp_ct, lim["max_body_bytes"])
+    resp_summary = summarize_body(resp_body, resp_ct, lim["max_response_bytes"])
 
     return {
+        "observation_schema_version": 2,
         "observation_id": f"obs-{source_ref}",
-        "timestamp": now_iso(),
+        "timestamp": observed_at or now_iso(),
+        "imported_at": now_iso(),
         "actor_id": actor_id,
         "method": method.upper(),
         "url": clean_url,
@@ -105,10 +163,24 @@ def _observation(actor_id: str, method: str, url: str, req_headers, req_body, st
             "header_names": sorted(resp_h.keys()),
             "headers": resp_h,
             "body": resp_summary,
+            "redirect": sanitize_redirect(resp_headers, campaign["target_host"]),
         },
+        "session": _session_summary(req_headers, resp_headers),
         "source": source,
         "source_ref": source_ref,
     }
+
+
+def _finalize_chronology(records: list[tuple[datetime | None, int, dict]]) -> tuple[list[dict], int]:
+    max_dt = datetime.max.replace(tzinfo=timezone.utc)
+    timestamped = sum(1 for dt, _idx, _obs in records if dt is not None)
+    records.sort(key=lambda item: (item[0] or max_dt, item[1]))
+    observations = []
+    for sequence_index, (_dt, _original_index, obs) in enumerate(records, start=1):
+        obs["sequence_index"] = sequence_index
+        observations.append(obs)
+    return observations, timestamped
+
 
 def import_har(campaign_id: str, actor_id: str, path: str) -> dict:
     _validate_actor(campaign_id, actor_id)
@@ -120,7 +192,7 @@ def import_har(campaign_id: str, actor_id: str, path: str) -> dict:
         raise FlowStateError(f"Invalid HAR JSON: {exc}") from exc
 
     entries = (((har or {}).get("log") or {}).get("entries") or [])
-    observations = []
+    records: list[tuple[datetime | None, int, dict]] = []
     skipped_out_of_target = 0
 
     for idx, entry in enumerate(entries):
@@ -139,7 +211,8 @@ def import_har(campaign_id: str, actor_id: str, path: str) -> dict:
             except Exception:
                 resp_body = None
 
-        observations.append(_observation(
+        observed_at, parsed_dt = _parse_observed_time(entry.get("startedDateTime"))
+        obs = _observation(
             actor_id,
             str(req.get("method") or "GET"),
             url,
@@ -150,8 +223,12 @@ def import_har(campaign_id: str, actor_id: str, path: str) -> dict:
             resp_body,
             "har",
             str(idx + 1),
-        ))
+            campaign,
+            observed_at=observed_at,
+        )
+        records.append((parsed_dt, idx, obs))
 
+    observations, timestamped = _finalize_chronology(records)
     saved = save_observations(campaign_id, observations, limits()["max_observations"])
     return {
         "ok": True,
@@ -159,13 +236,16 @@ def import_har(campaign_id: str, actor_id: str, path: str) -> dict:
         "actor_id": actor_id,
         "parsed": len(observations),
         "skipped_out_of_target": skipped_out_of_target,
+        "chronology_sorted": True,
+        "timestamped": timestamped,
         **saved,
     }
 
+
 def _parse_raw_http_request(raw: str) -> tuple[str, str, dict, str]:
-    head, _, body = raw.partition("\r\n\r\n")
-    if not _:
-        head, _, body = raw.partition("\n\n")
+    head, separator, body = raw.partition("\r\n\r\n")
+    if not separator:
+        head, separator, body = raw.partition("\n\n")
     lines = head.splitlines()
     if not lines:
         return "GET", "/", {}, body
@@ -179,10 +259,11 @@ def _parse_raw_http_request(raw: str) -> tuple[str, str, dict, str]:
             headers[k.strip()] = v.strip()
     return method, target, headers, body
 
+
 def _parse_raw_http_response(raw: str) -> tuple[int | None, dict, str]:
-    head, _, body = raw.partition("\r\n\r\n")
-    if not _:
-        head, _, body = raw.partition("\n\n")
+    head, separator, body = raw.partition("\r\n\r\n")
+    if not separator:
+        head, separator, body = raw.partition("\n\n")
     lines = head.splitlines()
     status = None
     if lines:
@@ -196,6 +277,7 @@ def _parse_raw_http_response(raw: str) -> tuple[int | None, dict, str]:
             headers[k.strip()] = v.strip()
     return status, headers, body
 
+
 def import_burp_xml(campaign_id: str, actor_id: str, path: str) -> dict:
     _validate_actor(campaign_id, actor_id)
     campaign = get_campaign(campaign_id)
@@ -205,7 +287,7 @@ def import_burp_xml(campaign_id: str, actor_id: str, path: str) -> dict:
     except Exception as exc:
         raise FlowStateError(f"Invalid Burp XML: {exc}") from exc
 
-    observations = []
+    records: list[tuple[datetime | None, int, dict]] = []
     skipped_out_of_target = 0
 
     for idx, item in enumerate(root.findall(".//item")):
@@ -237,8 +319,9 @@ def import_burp_xml(campaign_id: str, actor_id: str, path: str) -> dict:
 
         method, _target, req_headers, req_body = _parse_raw_http_request(req_raw)
         status, resp_headers, resp_body = _parse_raw_http_response(resp_raw)
+        observed_at, parsed_dt = _parse_observed_time(item.findtext("time"))
 
-        observations.append(_observation(
+        obs = _observation(
             actor_id,
             method,
             url,
@@ -249,8 +332,12 @@ def import_burp_xml(campaign_id: str, actor_id: str, path: str) -> dict:
             resp_body,
             "burp_xml",
             str(idx + 1),
-        ))
+            campaign,
+            observed_at=observed_at,
+        )
+        records.append((parsed_dt, idx, obs))
 
+    observations, timestamped = _finalize_chronology(records)
     saved = save_observations(campaign_id, observations, limits()["max_observations"])
     return {
         "ok": True,
@@ -258,5 +345,7 @@ def import_burp_xml(campaign_id: str, actor_id: str, path: str) -> dict:
         "actor_id": actor_id,
         "parsed": len(observations),
         "skipped_out_of_target": skipped_out_of_target,
+        "chronology_sorted": True,
+        "timestamped": timestamped,
         **saved,
     }
