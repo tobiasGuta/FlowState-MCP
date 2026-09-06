@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+import flowstate
 from flowstate import store
 from flowstate.analyzer import build_graph
 from flowstate.hypotheses import transition_hypotheses
@@ -137,11 +140,13 @@ def test_generic_workflow_span_prioritizes_protected_destination_without_path_ru
 
 
 def test_production_workflow_rules_are_target_agnostic():
-    # The regression fixture deliberately uses unrelated route names. The production rule should derive behavior
-    # from status changes, redirects, session boundaries, and HTTP semantics rather than special-casing lab paths.
-    from flowstate import workflow
-
-    source = open(workflow.__file__, "r", encoding="utf-8").read()
-    assert "/my-account" not in source
-    assert "/role-selector" not in source
-    assert "web-security-academy" not in source
+    # Regression fixtures can model any workflow, but production modules must not contain special cases for the
+    # benchmark target or its route names.
+    package_root = Path(flowstate.__file__).resolve().parent
+    production_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(package_root.glob("*.py"))
+    )
+    assert "/my-account" not in production_source
+    assert "/role-selector" not in production_source
+    assert "web-security-academy" not in production_source
