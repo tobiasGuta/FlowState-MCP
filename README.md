@@ -35,6 +35,46 @@ FlowState can remember the actors, objects, transitions, and evidence behind tho
 
 Those are hypotheses, not vulnerability findings.
 
+## Design principle: no target-specific heuristics
+
+A lab or real target may reveal a weakness in FlowState's model, but the production fix must describe a **general web-workflow property**, not the target's route names or known solution.
+
+FlowState must not special-case paths such as `/account`, `/checkout`, `/dashboard`, or any lab-specific endpoint. Instead, it should reason from evidence such as:
+
+- chronological timestamps;
+- session continuity and session rotation;
+- redirects and sanitized Referer relationships;
+- HTTP method and response semantics;
+- observed state fields;
+- the same endpoint changing from a redirect/denial-like response to a successful response.
+
+Regression fixtures are allowed to resemble bugs that exposed a weakness. Production code is not.
+
+## v0.1.3 workflow intelligence
+
+v0.1.3 adds generic workflow-span reasoning on top of the v0.1.2 chronology model:
+
+- redirect-follow GET/HEAD observations are identified as navigation edges;
+- navigation that also rotates a session or carries state evidence remains a meaningful state boundary;
+- the same endpoint changing from redirect to success is surfaced as an access-gate candidate;
+- transition hypotheses are ranked by bug-hunting value;
+- whole-span checkpoint hypotheses target the protected destination instead of only examining adjacent triples;
+- low-value local skip hypotheses whose destination is merely a redirect-follow navigation request are suppressed.
+
+For an observed span like:
+
+```text
+resource denied
+      ↓
+workflow step A
+      ↓
+workflow step B
+      ↓
+resource succeeds
+```
+
+FlowState can ask whether the resource becomes accessible immediately after A, before B is completed, without knowing anything about the application's path names.
+
 ## V1 safety boundary
 
 FlowState V1:
