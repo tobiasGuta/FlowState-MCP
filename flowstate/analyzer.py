@@ -4,6 +4,7 @@ import re
 from collections import defaultdict
 
 from .store import all_observations, list_actors
+from .workflow import navigation_evidence
 
 GENERIC_SEGMENTS = {
     "api", "v1", "v2", "v3", "users", "user", "accounts", "account",
@@ -109,6 +110,28 @@ def _behavior_changes(observations: list[dict]) -> list[dict]:
     return changes
 
 
+def _security_relevant_destinations(behavior_changes: list[dict]) -> list[dict]:
+    destinations = []
+    for change in behavior_changes:
+        if change.get("type") != "redirect_to_success":
+            continue
+        destinations.append({
+            "type": "access_gate_change",
+            "actor_id": change.get("actor_id"),
+            "method": change.get("method"),
+            "path": change.get("path"),
+            "before_observation_id": (change.get("before") or {}).get("observation_id"),
+            "after_observation_id": (change.get("after") or {}).get("observation_id"),
+            "before_status": (change.get("before") or {}).get("status"),
+            "after_status": (change.get("after") or {}).get("status"),
+            "reason": (
+                "The same actor and endpoint changed from a redirect response to a successful response "
+                "across an observed workflow span."
+            ),
+        })
+    return destinations
+
+
 def build_graph(campaign_id: str) -> dict:
     observations = all_observations(campaign_id)
     actors = {a["actor_id"]: a for a in list_actors(campaign_id)}
@@ -188,6 +211,8 @@ def build_graph(campaign_id: str) -> dict:
 
     sequence_edges = _sequence_edges(observations)
     behavior_changes = _behavior_changes(observations)
+    navigation_observations = navigation_evidence(observations)
+    security_relevant_destinations = _security_relevant_destinations(behavior_changes)
     return {
         "campaign_id": campaign_id,
         "node_count": len(nodes),
@@ -195,11 +220,16 @@ def build_graph(campaign_id: str) -> dict:
         "transition_count": len(transitions),
         "sequence_edge_count": len(sequence_edges),
         "behavior_change_count": len(behavior_changes),
+        "navigation_observation_count": len(navigation_observations),
+        "pure_navigation_count": sum(1 for item in navigation_observations if item.get("pure_navigation")),
+        "security_relevant_destination_count": len(security_relevant_destinations),
         "nodes": list(nodes.values()),
         "edges": edges,
         "transitions": transitions,
         "sequence_edges": sequence_edges,
         "behavior_changes": behavior_changes,
+        "navigation_observations": navigation_observations,
+        "security_relevant_destinations": security_relevant_destinations,
     }
 
 
