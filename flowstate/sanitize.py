@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from urllib.parse import parse_qsl, urlsplit
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
 SENSITIVE_HEADER_NAMES = {
     "authorization",
@@ -24,7 +25,7 @@ SENSITIVE_KEY_RE = re.compile(
 )
 
 ID_KEY_RE = re.compile(
-    r"(^id$|_id$|Id$|ID$|uuid$|guid$|slug$|key$|invite$|invitation$|"
+    r"(^id$|_id$|Id$|ID$|uuid$|guid$|slug$|key$|code$|invite$|invitation$|"
     r"workspace$|organization$|org$|team$|project$|member$|user$|account$)",
     re.I,
 )
@@ -35,11 +36,12 @@ STATE_KEY_RE = re.compile(
     re.I,
 )
 
+OPAQUE_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{24,}$")
+
+
 def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
-
-OPAQUE_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{24,}$")
 
 def safe_scalar(value) -> str | None:
     if value is None:
@@ -55,6 +57,7 @@ def safe_scalar(value) -> str | None:
         return f"<opaque:{fingerprint(sval)}>"
     return sval[:256]
 
+
 def sanitize_path(path: str) -> str:
     segments = path.split("/")
     out = []
@@ -64,6 +67,23 @@ def sanitize_path(path: str) -> str:
         else:
             out.append(segment[:256])
     return "/".join(out)
+
+
+def _header_values(headers, wanted_name: str) -> list[str]:
+    wanted = wanted_name.lower()
+    values: list[str] = []
+    if isinstance(headers, dict):
+        for name, value in headers.items():
+            if str(name).lower() == wanted:
+                values.append(str(value))
+    elif isinstance(headers, list):
+        for item in headers:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name", "")).lower() == wanted:
+                values.append(str(item.get("value", "")))
+    return values
+
 
 def sanitize_headers(headers) -> dict:
     result = {}
@@ -84,6 +104,7 @@ def sanitize_headers(headers) -> dict:
             result[str(name)] = str(value)[:1024]
     return result
 
+
 def sanitize_query(url: str) -> tuple[str, list[str]]:
     p = urlsplit(url)
     names = []
@@ -91,6 +112,59 @@ def sanitize_query(url: str) -> tuple[str, list[str]]:
         names.append(key)
     clean = f"{p.scheme}://{p.netloc}{p.path}" if p.scheme and p.netloc else p.path
     return clean, sorted(set(names))
+
+
+def sanitize_redirect(headers, target_host: str) -> dict | None:
+    values = _header_values(headers, "location")
+    if not values:
+        return None
+    raw = values[-1].strip()
+    if not raw:
+        return None
+
+    absolute = urljoin(f"https://{target_host}/", raw)
+    parsed = urlsplit(absolute)
+    host = (parsed.hostname or "").lower()
+    query_names = sorted({k for k, _v in parse_qsl(parsed.query, keep_blank_values=True)})
+    result = {
+        "path": sanitize_path(parsed.path or "/"),
+        "query_parameter_names": query_names,
+        "same_target": host == target_host or host.endswith("." + target_host),
+    }
+    if not result["same_target"]:
+        result["host"] = host[:253]
+    return result
+
+
+def cookie_fingerprints(headers) -> dict[str, str]:
+    """Return only cookie-name -> short hash mappings; never cookie values."""
+    result: dict[str, str] = {}
+    for raw in _header_values(headers, "cookie"):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(raw)
+        except Exception:
+            continue
+        for name, morsel in cookie.items():
+            if morsel.value:
+                result[str(name)[:128]] = fingerprint(morsel.value)
+    return result
+
+
+def set_cookie_fingerprints(headers) -> dict[str, str]:
+    """Return only Set-Cookie name -> short hash mappings; never cookie values."""
+    result: dict[str, str] = {}
+    for raw in _header_values(headers, "set-cookie"):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(raw)
+        except Exception:
+            continue
+        for name, morsel in cookie.items():
+            if morsel.value:
+                result[str(name)[:128]] = fingerprint(morsel.value)
+    return result
+
 
 def _walk_json(value, prefix="$", depth=0, max_depth=6, out=None):
     if out is None:
@@ -131,6 +205,7 @@ def _walk_json(value, prefix="$", depth=0, max_depth=6, out=None):
             _walk_json(child, f"{prefix}[{i}]", depth + 1, max_depth, out)
 
     return out
+
 
 def summarize_body(body: str | bytes | None, content_type: str | None, max_bytes: int) -> dict:
     if body is None:
