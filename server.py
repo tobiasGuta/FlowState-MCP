@@ -11,6 +11,7 @@ from flowstate.hypotheses import actor_swap_hypotheses as actor_swap_hypotheses_
 from flowstate.hypotheses import transition_hypotheses as transition_hypotheses_logic
 from flowstate.importers import import_burp_xml as import_burp_xml_logic
 from flowstate.importers import import_har as import_har_logic
+from flowstate.queue import build_hypothesis_queue as build_hypothesis_queue_logic
 from flowstate.store import (
     FlowStateError,
     create_campaign as create_campaign_logic,
@@ -45,6 +46,7 @@ AVAILABLE_TOOLS = [
     "flow_generate_actor_swap_hypotheses",
     "flow_record_hypothesis_validation",
     "flow_list_hypothesis_validations",
+    "flow_next_hypotheses",
 ]
 
 
@@ -61,7 +63,8 @@ def flow_health() -> dict:
         "request_replay": False,
         "safety_note": (
             "FlowState V1 only imports local traffic artifacts, stores sanitized observations, "
-            "builds workflow models, generates hypotheses, and records structured manual-validation results."
+            "builds workflow models, generates hypotheses, records structured manual-validation results, "
+            "and prioritizes unresolved hypotheses."
         ),
         "burp_mcp_boundary": (
             "Use Burp MCP separately for controlled request inspection or replay. "
@@ -198,6 +201,27 @@ def flow_list_hypothesis_validations(
         "campaign_id": campaign_id,
         "validations": list_hypothesis_validations_logic(campaign_id, hypothesis_id, limit),
     }
+
+
+@mcp.tool()
+def flow_next_hypotheses(
+    campaign_id: str,
+    limit: int = 20,
+    include_inconclusive: bool = True,
+) -> dict:
+    """Return the highest-value unresolved hypotheses after accounting for prior validation results."""
+    transition_result = transition_hypotheses_logic(campaign_id, 200)
+    actor_swap_result = actor_swap_hypotheses_logic(campaign_id, 200)
+    hypotheses = [
+        *transition_result.get("hypotheses", []),
+        *actor_swap_result.get("hypotheses", []),
+    ]
+    return build_hypothesis_queue_logic(
+        campaign_id=campaign_id,
+        hypotheses=hypotheses,
+        limit=limit,
+        include_inconclusive=include_inconclusive,
+    )
 
 
 if __name__ == "__main__":
