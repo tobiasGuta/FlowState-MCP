@@ -11,6 +11,7 @@ GENERIC_SEGMENTS = {
     "members", "member", "invitations", "invites", "invite", "workspaces", "workspace",
 }
 
+
 def _path_entities(path: str) -> list[dict]:
     segments = [s for s in path.split("/") if s]
     entities = []
@@ -25,6 +26,7 @@ def _path_entities(path: str) -> list[dict]:
             entities.append({"type": prev.rstrip("s") or "resource", "value": seg, "source": "path"})
     return entities
 
+
 def _body_entities(summary: dict, source: str) -> list[dict]:
     result = []
     for item in summary.get("identifiers", []):
@@ -36,6 +38,7 @@ def _body_entities(summary: dict, source: str) -> list[dict]:
         })
     return result
 
+
 def _states(summary: dict, source: str) -> list[dict]:
     return [
         {
@@ -46,6 +49,65 @@ def _states(summary: dict, source: str) -> list[dict]:
         }
         for i in summary.get("state_fields", [])
     ]
+
+
+def _sequence_edges(observations: list[dict]) -> list[dict]:
+    by_actor: dict[str, list[dict]] = defaultdict(list)
+    for obs in observations:
+        by_actor[obs["actor_id"]].append(obs)
+
+    edges = []
+    for actor_id, actor_obs in by_actor.items():
+        for left, right in zip(actor_obs, actor_obs[1:]):
+            edges.append({
+                "actor_id": actor_id,
+                "from_observation_id": left["observation_id"],
+                "to_observation_id": right["observation_id"],
+                "from": {"method": left["method"], "path": left["path"], "status": left["status"]},
+                "to": {"method": right["method"], "path": right["path"], "status": right["status"]},
+            })
+    return edges
+
+
+def _behavior_changes(observations: list[dict]) -> list[dict]:
+    by_actor_endpoint: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for obs in observations:
+        by_actor_endpoint[(obs["actor_id"], obs["method"], obs["path"])].append(obs)
+
+    changes = []
+    for (actor_id, method, path), endpoint_obs in by_actor_endpoint.items():
+        for before_index, before in enumerate(endpoint_obs):
+            before_status = before.get("status")
+            if before_status is None:
+                continue
+            for after in endpoint_obs[before_index + 1:]:
+                after_status = after.get("status")
+                if after_status is None or after_status == before_status:
+                    continue
+                if 300 <= before_status < 400 and 200 <= after_status < 300:
+                    all_actor = [o for o in observations if o["actor_id"] == actor_id]
+                    pos_before = all_actor.index(before)
+                    pos_after = all_actor.index(after)
+                    intermediate = all_actor[pos_before + 1:pos_after]
+                    changes.append({
+                        "type": "redirect_to_success",
+                        "actor_id": actor_id,
+                        "method": method,
+                        "path": path,
+                        "before": {
+                            "observation_id": before["observation_id"],
+                            "status": before_status,
+                            "redirect": before.get("response", {}).get("redirect"),
+                        },
+                        "after": {
+                            "observation_id": after["observation_id"],
+                            "status": after_status,
+                        },
+                        "intermediate_observation_ids": [o["observation_id"] for o in intermediate],
+                    })
+                    break
+    return changes
+
 
 def build_graph(campaign_id: str) -> dict:
     observations = all_observations(campaign_id)
@@ -99,6 +161,7 @@ def build_graph(campaign_id: str) -> dict:
             for after in matching:
                 if rs["value"] != after["value"]:
                     transitions.append({
+                        "type": "body_state",
                         "field": rs["field"],
                         "before": rs["value"],
                         "after": after["value"],
@@ -108,15 +171,37 @@ def build_graph(campaign_id: str) -> dict:
                         "observation_id": obs["observation_id"],
                     })
 
+        session = obs.get("session") or {}
+        before_session = session.get("request_session_fingerprint")
+        after_session = session.get("response_session_fingerprint")
+        if before_session and after_session and before_session != after_session:
+            transitions.append({
+                "type": "session_rotation",
+                "field": "session_fingerprint",
+                "before": before_session,
+                "after": after_session,
+                "actor_id": actor_id,
+                "action": obs["action"],
+                "path": obs["path"],
+                "observation_id": obs["observation_id"],
+            })
+
+    sequence_edges = _sequence_edges(observations)
+    behavior_changes = _behavior_changes(observations)
     return {
         "campaign_id": campaign_id,
         "node_count": len(nodes),
         "edge_count": len(edges),
         "transition_count": len(transitions),
+        "sequence_edge_count": len(sequence_edges),
+        "behavior_change_count": len(behavior_changes),
         "nodes": list(nodes.values()),
         "edges": edges,
         "transitions": transitions,
+        "sequence_edges": sequence_edges,
+        "behavior_changes": behavior_changes,
     }
+
 
 def actor_permissions(campaign_id: str) -> dict:
     observations = all_observations(campaign_id)
@@ -142,6 +227,7 @@ def actor_permissions(campaign_id: str) -> dict:
 
     return {"campaign_id": campaign_id, "actors": serial}
 
+
 def object_history(campaign_id: str, entity_value: str) -> dict:
     observations = all_observations(campaign_id)
     matches = []
@@ -161,6 +247,7 @@ def object_history(campaign_id: str, entity_value: str) -> dict:
             matches.append({
                 "observation_id": obs["observation_id"],
                 "timestamp": obs["timestamp"],
+                "sequence_index": obs.get("sequence_index"),
                 "actor_id": obs["actor_id"],
                 "action": obs["action"],
                 "method": obs["method"],
