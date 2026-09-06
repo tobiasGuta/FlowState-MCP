@@ -4,7 +4,7 @@ FlowState MCP is a local Model Context Protocol server for **persistent business
 
 It is not a vulnerability scanner and it does not send requests.
 
-V1 imports local Burp XML or HAR traffic, assigns each import to a human-defined actor, strips authentication secrets, extracts workflow-relevant identifiers and state fields, builds an actor/entity/action/state graph, and proposes **hypotheses** for manual validation.
+V1 imports local Burp XML or HAR traffic, assigns each import to a human-defined actor, strips authentication secrets, extracts workflow-relevant identifiers and state fields, builds an actor/entity/action/state graph, proposes **hypotheses** for manual validation, and can persist structured validation outcomes.
 
 ## Why it exists
 
@@ -75,6 +75,49 @@ resource succeeds
 
 FlowState can ask whether the resource becomes accessible immediately after A, before B is completed, without knowing anything about the application's path names.
 
+## v0.1.4 evidence lifecycle
+
+v0.1.4 keeps FlowState passive but lets it remember what happened when a human manually validates a generated hypothesis.
+
+Generated hypotheses now receive stable campaign-local IDs plus a validation state:
+
+```text
+untested
+   ↓
+supported | falsified | inconclusive
+```
+
+`flow_record_hypothesis_validation` stores only structured, sanitized evidence such as:
+
+- the hypothesis ID;
+- manual outcome (`supported`, `falsified`, or `inconclusive`);
+- test method and path;
+- observed HTTP status;
+- sanitized redirect path;
+- a bounded note with obvious secret assignments redacted.
+
+Query values are not persisted in validation paths. Cookies, session values, credentials, CSRF values, and token material are not required or intentionally stored.
+
+A `supported` hypothesis still does **not** mean "confirmed vulnerability". It means manual evidence supported the security concern represented by that hypothesis. Reporting impact and vulnerability status remain separate human decisions.
+
+The lifecycle becomes:
+
+```text
+passive traffic
+      ↓
+workflow model
+      ↓
+hypothesis (untested)
+      ↓
+manual validation outside FlowState
+      ↓
+record structured result
+      ↓
+supported / falsified / inconclusive
+      ↓
+regenerated hypothesis keeps that history
+```
+
 ## V1 safety boundary
 
 FlowState V1:
@@ -85,10 +128,11 @@ FlowState V1:
 - has no scanner;
 - has no exploit runner;
 - does not replay requests;
-- does not store Authorization, Cookie, Set-Cookie, API-key, password, or token values;
+- does not store Authorization, Cookie, Set-Cookie, API-key, password, or token values from imported traffic;
 - filters imports to the campaign target host and its subdomains;
 - uses bounded import sizes and bounded observation counts;
-- labels hypotheses as requiring manual validation.
+- labels hypotheses as requiring manual validation;
+- records validation outcomes only after an external/manual test has already occurred.
 
 Use your existing Burp MCP separately when you intentionally want the AI client to inspect or replay a request.
 
@@ -108,8 +152,10 @@ Use your existing Burp MCP separately when you intentionally want the AI client 
 | `flow_build_state_graph` | Build actor/entity/action/state relationships |
 | `flow_show_actor_permissions` | Compare observed behavior by actor |
 | `flow_show_object_history` | Trace one identifier across observations |
-| `flow_generate_transition_hypotheses` | Generate replay/state-transition questions |
-| `flow_generate_actor_swap_hypotheses` | Generate actor-comparison questions |
+| `flow_generate_transition_hypotheses` | Generate ranked transition questions with persistent validation status |
+| `flow_generate_actor_swap_hypotheses` | Generate actor-comparison questions with persistent validation status |
+| `flow_record_hypothesis_validation` | Persist a structured manual validation outcome for a generated hypothesis |
+| `flow_list_hypothesis_validations` | List validation history for a campaign or one hypothesis |
 
 ## Install
 
@@ -189,7 +235,10 @@ ScopeNest containers
               ↓
       manual validation
               ↓
-          Burp MCP
+      record safe result
+              ↓
+   supported / falsified /
+        inconclusive
 ```
 
 ## Example session
@@ -204,27 +253,28 @@ ScopeNest containers
    name="Owner"
    roles=["organization_owner"]
 
-3. flow_register_actor
-   actor_id="member"
-   name="Member"
-   roles=["organization_member"]
+3. Export Owner traffic from Burp as XML or HAR.
 
-4. Export Owner traffic from Burp as XML or HAR.
+4. flow_import_burp_xml
 
-5. flow_import_burp_xml
-   campaign_id="..."
-   actor_id="owner"
-   path="D:/BugBounty/target/owner.xml"
+5. flow_build_state_graph
 
-6. Repeat for Member.
+6. flow_generate_transition_hypotheses
+   # note the hypothesis_id of the question you manually test
 
-7. flow_build_state_graph
+7. Perform the controlled validation separately.
 
-8. flow_show_actor_permissions
+8. flow_record_hypothesis_validation
+   hypothesis_id="hyp-..."
+   outcome="supported"
+   test_method="GET"
+   test_path="/protected-resource"
+   observed_status=200
 
 9. flow_generate_transition_hypotheses
+   # the same hypothesis now reports validation_status="supported"
 
-10. flow_generate_actor_swap_hypotheses
+10. flow_list_hypothesis_validations
 ```
 
 ## What V1 deliberately does not do
@@ -253,7 +303,7 @@ without turning guesses into facts.
 
 FlowState V1 is successful only if, on a real bug-bounty session, it produces at least one hypothesis that you would genuinely test and that you did not immediately notice from raw Burp history alone.
 
-If it cannot do that, we should improve the model before adding active features.
+The next bar is stronger: the hypothesis should survive controlled manual validation and FlowState should preserve that evidence without turning a hypothesis into a vulnerability claim automatically.
 
 ## License
 
