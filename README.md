@@ -4,7 +4,7 @@ FlowState MCP is a local Model Context Protocol server for **persistent business
 
 It is not a vulnerability scanner and it does not send requests.
 
-V1 imports local Burp XML or HAR traffic, assigns each import to a human-defined actor, strips authentication secrets, extracts workflow-relevant identifiers and state fields, builds an actor/entity/action/state graph, proposes **hypotheses** for manual validation, and can persist structured validation outcomes.
+V1 imports local Burp XML or HAR traffic, assigns each import to a human-defined actor, strips authentication secrets, extracts workflow-relevant identifiers and state fields, builds an actor/entity/action/state graph, proposes **hypotheses** for manual validation, can persist structured validation outcomes, and can prioritize the highest-value unresolved hypotheses.
 
 ## Why it exists
 
@@ -79,7 +79,7 @@ FlowState can ask whether the resource becomes accessible immediately after A, b
 
 v0.1.4 keeps FlowState passive but lets it remember what happened when a human manually validates a generated hypothesis.
 
-Generated hypotheses now receive stable campaign-local IDs plus a validation state:
+Generated hypotheses receive stable campaign-local IDs plus a validation state:
 
 ```text
 untested
@@ -118,6 +118,34 @@ supported / falsified / inconclusive
 regenerated hypothesis keeps that history
 ```
 
+## v0.1.5 validation-aware queue
+
+v0.1.5 uses the persisted validation history to answer a new question:
+
+> Given what has already been tested, what should I test next?
+
+`flow_next_hypotheses` combines current transition and actor-comparison hypotheses, attaches their persisted validation status, and returns only actionable unresolved work.
+
+Queue behavior is intentionally conservative:
+
+- `untested` hypotheses keep their normal hunting priority;
+- `inconclusive` hypotheses remain actionable but receive a small retry penalty;
+- `supported` and `falsified` hypotheses remain visible in normal hypothesis/history output but are excluded from the next-action queue;
+- an `intermediate_state_access` umbrella hypothesis does not compete with concrete `workflow_checkpoint_access` children for the same actor and destination;
+- resolving one child hypothesis does **not** automatically mark its broader parent supported or falsified.
+
+For example:
+
+```text
+SUPPORTED  score 95  checkpoint after step A
+UNTESTED   score 90  checkpoint after step B
+UNTESTED   score 50  explicit prerequisite omission
+```
+
+The queue recommends the score-90 unresolved checkpoint next while preserving the supported score-95 result as evidence.
+
+This is prioritization only. FlowState still does not send validation traffic.
+
 ## V1 safety boundary
 
 FlowState V1:
@@ -132,7 +160,8 @@ FlowState V1:
 - filters imports to the campaign target host and its subdomains;
 - uses bounded import sizes and bounded observation counts;
 - labels hypotheses as requiring manual validation;
-- records validation outcomes only after an external/manual test has already occurred.
+- records validation outcomes only after an external/manual test has already occurred;
+- prioritizes unresolved hypotheses without changing their evidence state.
 
 Use your existing Burp MCP separately when you intentionally want the AI client to inspect or replay a request.
 
@@ -156,6 +185,7 @@ Use your existing Burp MCP separately when you intentionally want the AI client 
 | `flow_generate_actor_swap_hypotheses` | Generate actor-comparison questions with persistent validation status |
 | `flow_record_hypothesis_validation` | Persist a structured manual validation outcome for a generated hypothesis |
 | `flow_list_hypothesis_validations` | List validation history for a campaign or one hypothesis |
+| `flow_next_hypotheses` | Return the highest-value unresolved hypotheses after accounting for validation history |
 
 ## Install
 
@@ -239,6 +269,8 @@ ScopeNest containers
               ↓
    supported / falsified /
         inconclusive
+              ↓
+      next unresolved work
 ```
 
 ## Example session
@@ -274,7 +306,10 @@ ScopeNest containers
 9. flow_generate_transition_hypotheses
    # the same hypothesis now reports validation_status="supported"
 
-10. flow_list_hypothesis_validations
+10. flow_next_hypotheses
+    # supported/falsified work is retained as history but omitted from the next-action queue
+
+11. flow_list_hypothesis_validations
 ```
 
 ## What V1 deliberately does not do
@@ -303,7 +338,7 @@ without turning guesses into facts.
 
 FlowState V1 is successful only if, on a real bug-bounty session, it produces at least one hypothesis that you would genuinely test and that you did not immediately notice from raw Burp history alone.
 
-The next bar is stronger: the hypothesis should survive controlled manual validation and FlowState should preserve that evidence without turning a hypothesis into a vulnerability claim automatically.
+The next bar is stronger: the hypothesis should survive controlled manual validation, FlowState should preserve that evidence without turning a hypothesis into a vulnerability claim automatically, and later prioritization should move on to the highest-value unresolved work.
 
 ## License
 
