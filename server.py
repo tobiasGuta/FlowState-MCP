@@ -64,7 +64,7 @@ def flow_health() -> dict:
         "safety_note": (
             "FlowState V1 only imports local traffic artifacts, stores sanitized observations, "
             "builds workflow models, generates hypotheses, records structured manual-validation results, "
-            "and prioritizes unresolved hypotheses."
+            "and prioritizes unresolved hypotheses while suppressing redundant covered workflow questions."
         ),
         "burp_mcp_boundary": (
             "Use Burp MCP separately for controlled request inspection or replay. "
@@ -209,7 +209,7 @@ def flow_next_hypotheses(
     limit: int = 20,
     include_inconclusive: bool = True,
 ) -> dict:
-    """Return the highest-value unresolved hypotheses after accounting for prior validation results."""
+    """Return actionable unresolved hypotheses plus later workflow questions subsumed by stronger supported evidence."""
     transition_result = transition_hypotheses_logic(campaign_id, 200)
     actor_swap_result = actor_swap_hypotheses_logic(campaign_id, 200)
     hypotheses = [
